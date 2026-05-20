@@ -1,3 +1,5 @@
+<img src="./fig2.png" width="400px"></img>
+
 ## WorldParticle (wip)
 
 Implementation of [WorldParticle](https://arxiv.org/abs/2605.15305), Unified World Simulation of Lagrangian Particle Dynamics via Transformer
