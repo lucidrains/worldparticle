@@ -29,7 +29,7 @@ dependencies = [
     "einx>=0.4.0",
     "einops>=0.8.1",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.0",
+    "torch-einops-utils>=0.1.1",
     "x-mlps-pytorch"
 ]
 

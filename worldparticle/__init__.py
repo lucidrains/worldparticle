@@ -1,1 +1,4 @@
-from worldparticle.worldparticle import WorldParticle
+from worldparticle.worldparticle import (
+    ParticleTransformer,
+    merge_tokens
+)
