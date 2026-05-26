@@ -52,19 +52,18 @@ def merge_tokens(
 
     even_seq_len = tokens.shape[1]
 
-    if not exists(weights):
-        weights = torch.ones((batch, even_seq_len), device = device)
-
     # mask
 
     mask = lens_to_mask(lens, even_seq_len)
 
+    if not exists(weights):
+        weights = mask.float()
+
     # do the split they propose, which is just every other index
 
     src_tokens, tgt_tokens = rearrange(tokens, 'b (n two) d -> two b n d', two = 2)
-    src_mask, tgt_mask = rearrange(mask, 'b (n two) -> two b n', two = 2)
-
     src_weights, tgt_weights = rearrange(weights, 'b (n two) -> two b n', two = 2)
+    src_mask, tgt_mask = rearrange(mask, 'b (n two) -> two b n', two = 2)
 
     # they do cosine sim
 
@@ -72,9 +71,15 @@ def merge_tokens(
 
     eye = torch.eye(even_seq_len // 2, device = device, dtype = torch.bool)
 
-    sim = sim.masked_fill(eye, -torch.finfo(sim.dtype).max)
+    mask_value = -torch.finfo(sim.dtype).max
+
+    sim = sim.masked_fill(eye, mask_value)
+    sim = einx.where('b j, b i j,', tgt_mask, sim, mask_value)
 
     closest_match_index = sim.argmax(dim = -1) # (b i)
+
+    # they merge the tokens, but keep track of the "mass", or the number of tokens merged within the super token
+    # updates are weighted accordingly
 
     expanded_closest_match_index = pad_right_ndim_to_and_expand_as(closest_match_index, tgt_tokens)
 
