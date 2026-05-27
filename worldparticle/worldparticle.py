@@ -58,8 +58,7 @@ def merge_tokens(
 
     mask = lens_to_mask(lens, even_seq_len)
 
-    if not exists(weights):
-        weights = mask.float()
+    weights = default(weights, 1.) * mask.float()
 
     # do the split they propose, which is just every other index
 
@@ -95,7 +94,7 @@ def merge_tokens(
     merged_weighted_tokens = weighted_src_tokens + closest_tgt_tokens
     merged_weights = src_weights + closest_tgt_weights
 
-    merged_tokens = einx.divide('b n d, b n', merged_weighted_tokens, merged_weights)
+    merged_tokens = einx.divide('b n d, b n', merged_weighted_tokens, merged_weights.clamp(min = 1e-5))
 
     # handle the unmerged tokens
 
