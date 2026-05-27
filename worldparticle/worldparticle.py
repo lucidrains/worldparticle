@@ -1,4 +1,5 @@
 import torch
+from torch import cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
@@ -8,7 +9,8 @@ from einops import rearrange, einsum
 from torch_einops_utils import (
     pad_right_ndim_to_and_expand_as,
     pad_right_at_dim,
-    lens_to_mask
+    pad_sequence,
+    lens_to_mask,
 )
 
 # helpers
@@ -69,7 +71,8 @@ def merge_tokens(
 
     sim = einsum(l2norm(src_tokens), l2norm(tgt_tokens), 'b i d, b j d -> b i j')
 
-    eye = torch.eye(even_seq_len // 2, device = device, dtype = torch.bool)
+    half_seq_len = even_seq_len // 2
+    eye = torch.eye(half_seq_len, device = device, dtype = torch.bool)
 
     mask_value = -torch.finfo(sim.dtype).max
 
@@ -78,7 +81,7 @@ def merge_tokens(
 
     closest_match_index = sim.argmax(dim = -1) # (b i)
 
-    # they merge the tokens, but keep track of the "mass", or the number of tokens merged within the super token
+    # they merge the tokens, but keep track of the weights / mass, or the number of tokens merged within the super token
     # updates are weighted accordingly
 
     expanded_closest_match_index = pad_right_ndim_to_and_expand_as(closest_match_index, tgt_tokens)
@@ -86,12 +89,37 @@ def merge_tokens(
     weighted_src_tokens = einx.multiply('b n d, b n', src_tokens, src_weights)
     weighted_tgt_tokens = einx.multiply('b n d, b n', tgt_tokens, tgt_weights)
 
-    merged_weighted_tokens = weighted_src_tokens.scatter_add(1, expanded_closest_match_index, weighted_tgt_tokens) 
-    denom = src_weights.scatter_add(1, closest_match_index, tgt_weights)
+    closest_tgt_tokens = weighted_tgt_tokens.gather(1, expanded_closest_match_index)
+    closest_tgt_weights = tgt_weights.gather(1, closest_match_index)
 
-    merged_tokens = einx.divide('b n d, b n', merged_weighted_tokens, denom)
+    merged_weighted_tokens = weighted_src_tokens + closest_tgt_tokens
+    merged_weights = src_weights + closest_tgt_weights
 
-    return merged_tokens, weights, lens
+    merged_tokens = einx.divide('b n d, b n', merged_weighted_tokens, merged_weights)
+
+    # handle the unmerged tokens
+
+    neg_ones = torch.ones_like(closest_match_index) * -1.
+    tgt_mask_unmerged = tgt_mask.float().scatter_add(1, closest_match_index, neg_ones) > 0.
+
+    unmerged_lens = tgt_mask_unmerged.sum(dim = -1).long()
+
+    unmerged_tgt_tokens = tgt_tokens[tgt_mask_unmerged].split(unmerged_lens.tolist())
+    unmerged_tgt_weights = tgt_weights[tgt_mask_unmerged].split(unmerged_lens.tolist())
+
+    unmerged_tgt_tokens = pad_sequence(unmerged_tgt_tokens, dim = 0)
+    unmerged_tgt_weights = pad_sequence(unmerged_tgt_weights, dim = 0)
+
+    # output are the merged tokens and unmerged target tokens
+
+    output_tokens = cat((merged_tokens, unmerged_tgt_tokens), dim = 1)
+    output_weights = cat((merged_weights, unmerged_tgt_weights), dim = 1)
+
+    output_lens = unmerged_lens + half_seq_len
+
+    # return new tokens, weights, and the lengths
+
+    return output_tokens, output_weights, output_lens
 
 # attention
 

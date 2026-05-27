@@ -20,12 +20,12 @@ Implementation of [WorldParticle](https://arxiv.org/abs/2605.15305), Unified Wor
 
 ```bibtex
 @misc{peng2026longcontextpretraininglighthouse,
-    title   = {Long Context Pre-Training with Lighthouse Attention}, 
+    title   = {Long Context Pre-Training with Lighthouse Attention},
     author  = {Bowen Peng and Subho Ghosh and Jeffrey Quesnelle},
     year    = {2026},
     eprint  = {2605.06554},
     archivePrefix = {arXiv},
     primaryClass = {cs.CL},
-    url     = {https://arxiv.org/abs/2605.06554}, 
+    url     = {https://arxiv.org/abs/2605.06554},
 }
 ```
