@@ -63,3 +63,18 @@ def test_corrector(film_context_with_weights):
 
     assert pos_delta.shape == (2, 63, 3)
     assert vel_delta.shape == (2, 63, 3)
+
+def test_predictor():
+    from worldparticle.worldparticle import ParticlePredictor
+    predictor = ParticlePredictor(delta_time = 0.01)
+
+    tokens = torch.randn(2, 63, 16)
+    pos = torch.randn(2, 63, 3)
+    vel = torch.randn(2, 63, 3)
+    forces = torch.randn(2, 63, 3)
+    mass = torch.ones(2, 63)
+
+    pos_pred, vel_pred = predictor(pos = pos, vel = vel, forces = forces, mass = mass)
+
+    assert pos_pred.shape == (2, 63, 3)
+    assert vel_pred.shape == (2, 63, 3)

@@ -478,3 +478,37 @@ class ParticleTransformerCorrector(Module):
         pos_residual, vel_residual = pos_vel.chunk(2, dim = -1)
 
         return CorrectorOutput(pos_residual, vel_residual)
+
+# non-neural predictor
+
+PredictorOutput = namedtuple('PredictorOutput', ['pos', 'vel'])
+
+class ParticlePredictor(Module):
+    def __init__(
+        self,
+        delta_time = 1.
+    ):
+        super().__init__()
+        self.register_buffer('delta_time', tensor(delta_time))
+
+    def forward(
+        self,
+        pos,
+        vel,
+        mass = None,
+        forces = None
+    ):
+        dt = self.delta_time
+
+        # section 3, equation 1: explicit prediction step
+
+        vel_pred = vel
+
+        if exists(forces):
+            assert exists(mass)
+            accel = einx.divide('b n p, b n', forces, mass.clamp(min = 1e-8))
+            vel_pred = vel_pred + dt * accel
+
+        pos_pred = pos + (dt / 2.) * (vel + vel_pred)
+
+        return PredictorOutput(pos_pred, vel_pred)
