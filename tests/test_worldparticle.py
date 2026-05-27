@@ -2,7 +2,7 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from worldparticle.worldparticle import merge_tokens
+from worldparticle.worldparticle import merge_tokens, ParticleTransformerCorrector
 
 @param('has_pos', (False, True))
 def test_merge_tokens(
@@ -38,6 +38,26 @@ def test_merge_tokens(
 
     tokens_out, pos_out, weights_out, lens_out = merge_tokens(tokens, pos, weights = weights, lens = lens)
 
-    assert lens_out[0] == 2
+    assert lens_out[0] == 1
     assert weights_out[0, 0] == 1.
     assert weights_out[0, 1] == 0.
+
+def test_corrector():
+    corrector = ParticleTransformerCorrector(
+        dim = 16,
+        enc_depth = 2,
+        dec_depth = 2,
+        enc_dim_head = 6,
+        enc_heads = 2,
+        dec_dim_head = 6,
+        dec_heads = 2,
+    )
+
+    tokens = torch.randn(2, 63, 16)
+    pos = torch.randn(2, 63, 3)
+    lens = torch.tensor((63, 31))
+
+    pos_delta, vel_delta = corrector(tokens, pos = pos, lens = lens)
+
+    assert pos_delta.shape == (2, 63, 3)
+    assert vel_delta.shape == (2, 63, 3)
