@@ -267,6 +267,32 @@ class Attention(Module):
 
         return self.to_out(out)
 
+# film
+
+class FiLM(Module):
+    def __init__(
+        self,
+        dim,
+        dim_cond
+    ):
+        super().__init__()
+        self.norm = RMSNorm(dim, elementwise_affine = False)
+
+        self.to_gamma_beta = Linear(dim_cond, dim * 2, bias = False)
+        torch.nn.init.zeros_(self.to_gamma_beta.weight)
+
+    def forward(
+        self,
+        tokens,
+        cond
+    ):
+        normed = self.norm(tokens)
+
+        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
+
+        scaled = einx.multiply('b n d, b n d', normed, gamma + 1.)
+        return einx.add('b n d, b n d', scaled, beta)
+
 # classes
 
 CorrectorOutput = namedtuple('CorrectorOutput', ['pos', 'vel'])
@@ -284,6 +310,8 @@ class ParticleTransformerCorrector(Module):
         ff_mult = 4,
         pred_dim_hidden = 512,
         pred_num_layers = 5,
+        film_context_with_weights = False,
+        film_cond_dim = None,
     ):
         super().__init__()
 
@@ -327,6 +355,24 @@ class ParticleTransformerCorrector(Module):
                 RMSNorm(dim),
                 FeedForward(dim, mult = ff_mult),
             ]))
+
+        # optional film conditioning of cross attention context tokens with super token weights
+
+        self.film_context_with_weights = film_context_with_weights
+
+        if film_context_with_weights:
+            film_cond_dim = default(film_cond_dim, dim)
+
+            self.weight_to_cond = Sequential(
+                Rearrange('... -> ... 1'),
+                Linear(1, film_cond_dim * 2),
+                SwiGLU(),
+                Linear(film_cond_dim, film_cond_dim)
+            )
+
+            self.films = ModuleList([FiLM(dim, film_cond_dim) for _ in range(dec_depth)])
+
+        # final norm and prediction head
 
         self.final_norm = RMSNorm(dim)
 
@@ -375,14 +421,14 @@ class ParticleTransformerCorrector(Module):
 
             enc_tokens = ff(ff_norm(enc_tokens)) + enc_tokens
 
-            enc_intermediates.append((enc_tokens, enc_pos, enc_lens))
+            enc_intermediates.append((enc_tokens, enc_pos, enc_weights, enc_lens))
 
         # super token decoder
 
         dec_tokens = tokens
         rotary_emb = self.axial_rotary_emb(pos)
 
-        for dec_layer, enc_layer_index in zip(self.dec_layers, self.enc_layer_indices):
+        for ind, (dec_layer, enc_layer_index) in enumerate(zip(self.dec_layers, self.enc_layer_indices)):
 
             (
                 cross_context_norm,
@@ -396,14 +442,20 @@ class ParticleTransformerCorrector(Module):
 
             # the decoder attends to successively merged super particle tokens
 
-            layer_enc_tokens, layer_enc_pos, layer_enc_lens = enc_intermediates[enc_layer_index]
+            layer_enc_tokens, layer_enc_pos, layer_enc_weights, layer_enc_lens = enc_intermediates[enc_layer_index]
 
             context_rotary_emb = self.axial_rotary_emb(layer_enc_pos)
             context_mask = lens_to_mask(layer_enc_lens, layer_enc_tokens.shape[1])
 
+            if self.film_context_with_weights:
+                context_cond = self.weight_to_cond(layer_enc_weights)
+                context = self.films[ind](layer_enc_tokens, context_cond)
+            else:
+                context = cross_context_norm(layer_enc_tokens)
+
             dec_tokens = cross_attn(
                 cross_norm(dec_tokens),
-                context = cross_context_norm(layer_enc_tokens),
+                context = context,
                 context_mask = context_mask,
                 rotary_emb = rotary_emb,
                 context_rotary_emb = context_rotary_emb

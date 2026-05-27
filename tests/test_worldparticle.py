@@ -42,7 +42,8 @@ def test_merge_tokens(
     assert weights_out[0, 0] == 1.
     assert weights_out[0, 1] == 0.
 
-def test_corrector():
+@param('film_context_with_weights', (False, True))
+def test_corrector(film_context_with_weights):
     corrector = ParticleTransformerCorrector(
         dim = 16,
         enc_depth = 2,
@@ -51,6 +52,7 @@ def test_corrector():
         enc_heads = 2,
         dec_dim_head = 6,
         dec_heads = 2,
+        film_context_with_weights = film_context_with_weights,
     )
 
     tokens = torch.randn(2, 63, 16)
