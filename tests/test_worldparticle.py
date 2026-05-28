@@ -2,7 +2,15 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from worldparticle.worldparticle import merge_tokens, ParticleTransformerCorrector
+from torch import nn
+
+try:
+    import torch_cluster
+    HAS_TORCH_CLUSTER = True
+except ImportError:
+    HAS_TORCH_CLUSTER = False
+
+from worldparticle.worldparticle import merge_tokens, ParticleTransformerCorrector, ParticleTokenizer
 
 @param('has_pos', (False, True))
 def test_merge_tokens(
@@ -80,7 +88,7 @@ def test_predictor():
     assert vel_pred.shape == (2, 63, 3)
 
 def test_worldparticle_rollout():
-    from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector
+    from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector, ParticleTokenizer
     from torch import nn
 
     corrector_kwargs = dict(
@@ -95,14 +103,16 @@ def test_worldparticle_rollout():
 
     predictor = ParticlePredictor(delta_time = 0.01)
 
-    class DummyTokenizer(nn.Module):
-        def forward(self, pos, vel, mass = None):
-            return torch.randn(pos.shape[0], pos.shape[1], 16)
+    tokenizer = ParticleTokenizer(
+        dim = 16,
+        dim_attr = 1,
+        grid_res = 5
+    )
 
     model = WorldParticle(
         predictor = predictor,
         corrector = corrector_kwargs,
-        tokenizer = DummyTokenizer()
+        tokenizer = tokenizer
     )
 
     pos = torch.randn(2, 63, 3)
@@ -113,21 +123,21 @@ def test_worldparticle_rollout():
 
     # default single step - no time dim in output
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, tokenizer_kwargs = dict(mass = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, tokenizer_kwargs = dict(attrs = mass))
 
     assert out.pos.shape == (2, 63, 3)
     assert out.vel.shape == (2, 63, 3)
 
     # explicit num_steps=1 - caller asked for trajectory, gets time dim
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 1, tokenizer_kwargs = dict(mass = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 1, tokenizer_kwargs = dict(attrs = mass))
 
     assert out.pos.shape == (2, 1, 63, 3)
     assert out.vel.shape == (2, 1, 63, 3)
 
     # multi-step rollout
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 3, tokenizer_kwargs = dict(mass = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 3, tokenizer_kwargs = dict(attrs = mass))
 
     assert out.pos.shape == (2, 3, 63, 3)
     assert out.vel.shape == (2, 3, 63, 3)
@@ -158,6 +168,44 @@ def test_worldparticle_rollout():
     # 4D forces auto-infers trajectory
 
     forces_4d = torch.randn(2, 3, 63, 3)
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces_4d, lens = lens, tokenizer_kwargs = dict(mass = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces_4d, lens = lens, tokenizer_kwargs = dict(attrs = mass))
 
     assert out.pos.shape == (2, 3, 63, 3)
+
+@pytest.mark.skipif(not HAS_TORCH_CLUSTER, reason = 'torch-cluster is required for dynamic neighbor derivation')
+def test_dynamic_neighbor_derivation():
+    b, n = 2, 10
+    dim = 16
+
+    tokenizer = ParticleTokenizer(
+        dim=dim,
+        dim_attr=1,
+        grid_res=5,
+        spatial_radius=2.0,
+        boundary_radius=2.0,
+        max_spatial_neighbors=5,
+        max_boundary_neighbors=4
+    )
+
+    # Dense tightly packed particles
+    pos = torch.randn(b, n, 3)
+    vel = torch.randn(b, n, 3)
+    attrs = torch.randn(b, n, 1)
+
+    boundary_pos = torch.randn(b, 15, 3)
+    boundary_attrs = torch.randn(b, 15, 1)
+
+    # Provide no indices!
+    tokens = tokenizer(
+        pos=pos,
+        vel=vel,
+        attrs=attrs,
+        boundary_pos=boundary_pos,
+        boundary_attrs=boundary_attrs
+    )
+
+    assert tokens.shape == (b, n, dim)
+
+    # Ensure gradients flow
+    loss = tokens.mean()
+    loss.backward()

@@ -2,8 +2,9 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
+from torch import nn
 from torch import cat, is_tensor, stack, Tensor, tensor
-from torch.nn import Linear, Module, ModuleList, RMSNorm, Sequential
+from torch.nn import Linear, Module, ModuleList, RMSNorm, Sequential, Parameter
 import torch.nn.functional as F
 
 import einx
@@ -13,6 +14,7 @@ from einops.layers.torch import Rearrange
 from x_mlps_pytorch import create_mlp
 
 from torch_einops_utils import (
+    pad_right_ndim_to,
     pad_right_ndim_to_and_expand_as,
     pad_right_at_dim,
     pad_sequence,
@@ -42,6 +44,67 @@ def l2norm(t):
 def gather_vectors(src, indices, dim = 1):
     expanded_indices = pad_right_ndim_to_and_expand_as(indices, src)
     return src.gather(dim, expanded_indices)
+
+def gather_neighbors(
+    src,        # (b n d)
+    indices     # (b m k)
+):              # -> (b m k d)
+    b = src.shape[0]
+    batch_seq = torch.arange(b, device = src.device)
+    batch_indices = pad_right_ndim_to(batch_seq, indices.ndim)
+    return src[batch_indices, indices]
+
+def derive_neighbors_from_radius(
+    pos_y,                  # (b m d)
+    pos_x,                  # (b n d)
+    r,
+    max_num_neighbors
+):                          # -> (b m k), (b m k)
+    try:
+        from torch_cluster import radius
+    except ImportError:
+        raise ImportError('torch-cluster must be installed to derive neighbors dynamically. Install with: pip install torch-cluster')
+
+    b, m, device = *pos_y.shape[:2], pos_y.device
+    _, n = pos_x.shape[:2]
+
+    pos_y_flat = rearrange(pos_y, 'b m d -> (b m) d')
+    pos_x_flat = rearrange(pos_x, 'b n d -> (b n) d')
+
+    batch_y = torch.arange(b, device = device).repeat_interleave(m)
+    batch_x = torch.arange(b, device = device).repeat_interleave(n)
+
+    edge_index = radius(
+        pos_x_flat,
+        pos_y_flat,
+        r = r,
+        batch_x = batch_x,
+        batch_y = batch_y,
+        max_num_neighbors = max_num_neighbors
+    )
+
+    dst_indices, src_indices = edge_index[0], edge_index[1]
+
+    dst_indices, perm = dst_indices.sort()
+    src_indices = src_indices[perm]
+
+    src_indices = src_indices % n
+
+    counts = torch.bincount(dst_indices, minlength = b * m)
+    max_k = min(int(counts.max().item()), max_num_neighbors)
+
+    if max_k == 0:
+        return pos_y.new_zeros(b, m, 0, dtype = torch.long), pos_y.new_zeros(b, m, 0, dtype = torch.bool)
+
+    mask = lens_to_mask(counts, max_len = max_k)
+
+    out_indices = pos_y.new_zeros(b * m, max_k, dtype = torch.long)
+    out_indices[mask] = src_indices
+
+    out_indices = rearrange(out_indices, '(b m) k -> b m k', b = b)
+    out_mask = rearrange(mask, '(b m) k -> b m k', b = b)
+
+    return out_indices, out_mask
 
 # 3d axial rotary embeddings
 
@@ -513,6 +576,148 @@ class ParticlePredictor(Module):
 
         return PredictorOutput(pos_pred, vel_pred)
 
+# 3d lattice learnable kernel
+
+class LearnableKernel3D(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        grid_res = 5,
+        radius = 1.
+    ):
+        super().__init__()
+        self.radius = radius
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.theta = Parameter(torch.randn(1, dim_in * dim_out, grid_res, grid_res, grid_res) * (dim_in ** -0.5))
+
+    def forward(
+        self,
+        rel_pos,    # (b n k 3)
+        features    # (b n k di)
+    ):              # -> (b n k do)
+
+        b, n, k = rel_pos.shape[:3]
+
+        grid = rearrange(rel_pos / self.radius, 'b n k c -> 1 1 1 (b n k) c')
+
+        weights = F.grid_sample(self.theta, grid, mode = 'bilinear', padding_mode = 'zeros', align_corners = True)
+        weights = rearrange(weights, '1 (i o) 1 1 p -> p i o', i = self.dim_in)
+
+        features = rearrange(features, 'b n k i -> (b n k) i')
+        out = einsum(features, weights, 'p i, p i o -> p o')
+
+        return rearrange(out, '(b n k) o -> b n k o', b = b, n = n, k = k)
+
+# particle tokenizer
+
+class ParticleTokenizer(Module):
+    def __init__(
+        self,
+        dim,
+        dim_attr = 0,
+        dim_boundary_attr = 0,
+        grid_res = 5,
+        spatial_radius = 1.,
+        boundary_radius = 1.,
+        topo_radius = 1.,
+        max_spatial_neighbors = 32,
+        max_boundary_neighbors = 32,
+        mlp_depth = 2,
+        dim_hidden = None,
+    ):
+        super().__init__()
+        self.max_spatial_neighbors = max_spatial_neighbors
+        self.max_boundary_neighbors = max_boundary_neighbors
+
+        dim_hidden = default(dim_hidden, dim)
+
+        self.kernel_spatial  = LearnableKernel3D(3 + dim_attr, dim, grid_res, spatial_radius)
+        self.kernel_boundary = LearnableKernel3D(max(dim_boundary_attr, 1), dim, grid_res, boundary_radius)
+        self.kernel_topo     = LearnableKernel3D(3 + dim_attr + 3, dim, grid_res, topo_radius)
+
+        dim_mlp_in = dim * 3 + 3 + dim_attr
+        self.to_tokens = create_mlp(dim_hidden, depth = mlp_depth, dim_in = dim_mlp_in, dim_out = dim)
+
+    def forward(
+        self,
+        pos,                        # (b, n, 3) - predicted positions x̃
+        vel,                        # (b, n, 3) - predicted velocities ṽ
+        attrs = None,               # (b, n, ca) - per-particle attributes c
+        pos_rest = None,            # (b, n, 3) - rest-pose positions x^0
+        spatial_indices = None,     # (b, n, ks) - spatial neighbor indices
+        spatial_mask = None,        # (b, n, ks)
+        boundary_pos = None,        # (b, m, 3) - boundary positions x^b
+        boundary_attrs = None,      # (b, m, cb) - boundary attributes c^b
+        boundary_indices = None,    # (b, n, kb) - boundary neighbor indices
+        boundary_mask = None,       # (b, n, kb)
+        topo_indices = None,        # (b, n, kt) - topological neighbor indices
+        topo_mask = None,           # (b, n, kt)
+    ):
+        b, n, device = *pos.shape[:2], pos.device
+
+        if exists(attrs):
+            attrs = pad_right_ndim_to(attrs, 3)
+
+        if exists(boundary_attrs):
+            boundary_attrs = pad_right_ndim_to(boundary_attrs, 3)
+
+        attrs = default(attrs, pos.new_empty(b, n, 0))
+
+        def aggregate(kernel, rel_pos, features, mask = None):
+            out = kernel(rel_pos, features)
+            if exists(mask):
+                out = einx.multiply('b n k d, b n k', out, mask)
+            return out.sum(dim = 2)
+
+        pos_i = rearrange(pos, 'b n d -> b n 1 d')
+
+        # spatial branch - particle-particle interactions
+
+        if not exists(spatial_indices) and exists(pos):
+            spatial_indices, spatial_mask = derive_neighbors_from_radius(pos, pos, self.kernel_spatial.radius, self.max_spatial_neighbors)
+
+        if exists(spatial_indices):
+            pos_j   = gather_neighbors(pos, spatial_indices)
+            vel_j   = gather_neighbors(vel, spatial_indices)
+            attrs_j = gather_neighbors(attrs, spatial_indices)
+
+            spatial_agg = aggregate(self.kernel_spatial, pos_j - pos_i, cat((vel_j, attrs_j), dim = -1), spatial_mask)
+        else:
+            spatial_agg = pos.new_zeros(b, n, self.kernel_spatial.dim_out)
+
+        # boundary branch - particle-boundary interactions
+
+        if not exists(boundary_indices) and exists(boundary_pos):
+            boundary_indices, boundary_mask = derive_neighbors_from_radius(pos, boundary_pos, self.kernel_boundary.radius, self.max_boundary_neighbors)
+
+        if exists(boundary_indices) and exists(boundary_pos):
+            pos_j_b = gather_neighbors(boundary_pos, boundary_indices)
+
+            attrs_j_b = gather_neighbors(boundary_attrs, boundary_indices) if exists(boundary_attrs) else pos.new_ones(*boundary_indices.shape, 1)
+
+            boundary_agg = aggregate(self.kernel_boundary, pos_j_b - pos_i, attrs_j_b, boundary_mask)
+        else:
+            boundary_agg = pos.new_zeros(b, n, self.kernel_boundary.dim_out)
+
+        # topology branch - rest-shape guided interactions
+
+        if exists(topo_indices) and exists(pos_rest):
+            pos_j      = gather_neighbors(pos, topo_indices)
+            vel_j      = gather_neighbors(vel, topo_indices)
+            attrs_j    = gather_neighbors(attrs, topo_indices)
+            pos_rest_j = gather_neighbors(pos_rest, topo_indices)
+
+            rel_pos_rest = einx.subtract('b n k d, b n d', pos_rest_j, pos_rest)
+            rel_pos_curr = einx.subtract('b n k d, b n d', pos_j, pos)
+
+            topo_agg = aggregate(self.kernel_topo, rel_pos_rest, cat((vel_j, attrs_j, rel_pos_curr), dim = -1), topo_mask)
+        else:
+            topo_agg = pos.new_zeros(b, n, self.kernel_topo.dim_out)
+
+        return self.to_tokens(cat((spatial_agg, boundary_agg, topo_agg, vel, attrs), dim = -1))
+
 # main module
 
 WorldParticleOutput = namedtuple('WorldParticleOutput', ['pos', 'vel'])
@@ -526,12 +731,12 @@ class WorldParticle(Module):
         tokenizer: Module | None = None
     ):
         super().__init__()
+        self.tokenizer = tokenizer
 
         predictor = default(predictor, dict())
 
         self.predictor = ParticlePredictor(**predictor) if isinstance(predictor, dict) else predictor
         self.corrector = ParticleTransformerCorrector(**corrector) if isinstance(corrector, dict) else corrector
-        self.tokenizer = tokenizer
 
     def forward(
         self,
