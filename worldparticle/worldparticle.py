@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import cat, Tensor, tensor
+from torch import cat, is_tensor, stack, Tensor, tensor
 from torch.nn import Linear, Module, ModuleList, RMSNorm, Sequential
 import torch.nn.functional as F
 
@@ -512,3 +512,111 @@ class ParticlePredictor(Module):
         pos_pred = pos + (dt / 2.) * (vel + vel_pred)
 
         return PredictorOutput(pos_pred, vel_pred)
+
+# main module
+
+WorldParticleOutput = namedtuple('WorldParticleOutput', ['pos', 'vel'])
+
+class WorldParticle(Module):
+    def __init__(
+        self,
+        *,
+        predictor: ParticlePredictor | dict | None = None,
+        corrector: ParticleTransformerCorrector | dict,
+        tokenizer: Module | None = None
+    ):
+        super().__init__()
+
+        predictor = default(predictor, dict())
+
+        self.predictor = ParticlePredictor(**predictor) if isinstance(predictor, dict) else predictor
+        self.corrector = ParticleTransformerCorrector(**corrector) if isinstance(corrector, dict) else corrector
+        self.tokenizer = tokenizer
+
+    def forward(
+        self,
+        *,
+        pos,                            # (b n 3)
+        vel,                            # (b n 3)
+        tokens = None,                  # (b n d) | (b steps n d)
+        mass = None,                    # (b n)
+        forces = None,                  # (b n 3) | (b steps n 3)
+        weights = None,                 # (b n)
+        lens = None,                    # (b)
+        num_steps = None,               # ()
+        return_initial_state = False,
+        tokenizer_kwargs: dict = dict()
+    ):
+        return_trajectory = exists(num_steps) or return_initial_state
+        has_tokenizer = exists(self.tokenizer)
+
+        # local functions
+
+        def is_tensor_with_time(t):
+            return is_tensor(t) and t.ndim == 4
+
+        def to_iterable(t, has_time):
+            if has_time:
+                return t.unbind(dim = 1)
+            if isinstance(t, (list, tuple)):
+                return t
+            return (t,) * num_steps
+
+        forces_has_time = is_tensor_with_time(forces)
+        tokens_has_time = not has_tokenizer and is_tensor_with_time(tokens)
+
+        # auto-infer num steps
+
+        if not exists(num_steps):
+            num_steps = forces.shape[1] if forces_has_time else (tokens.shape[1] if tokens_has_time else 1)
+            return_trajectory = (num_steps > 1) or return_initial_state
+
+        # unpack time dimension if exists, else repeat
+
+        forces = to_iterable(forces, forces_has_time)
+        tokens = to_iterable(tokens, tokens_has_time)
+
+        # rollout
+
+        curr_pos, curr_vel = pos, vel
+        positions, velocities = [], []
+
+        for step_forces, step_tokens in zip(forces, tokens):
+
+            pred_pos, pred_vel = self.predictor(
+                pos = curr_pos,
+                vel = curr_vel,
+                mass = mass,
+                forces = step_forces
+            )
+
+            if has_tokenizer:
+                step_tokens = self.tokenizer(pos = pred_pos, vel = pred_vel, **tokenizer_kwargs)
+
+            assert exists(step_tokens), 'tokens must be provided if tokenizer is not available'
+
+            pos_residual, vel_residual = self.corrector(
+                tokens = step_tokens,
+                pos = pred_pos,
+                weights = weights,
+                lens = lens
+            )
+
+            curr_pos = pred_pos + pos_residual
+            curr_vel = pred_vel + vel_residual
+
+            positions.append(curr_pos)
+            velocities.append(curr_vel)
+
+        if return_initial_state:
+            positions.insert(0, pos)
+            velocities.insert(0, vel)
+
+        # stack
+
+        positions, velocities = (stack(t, dim = 1) for t in (positions, velocities))
+
+        if not return_trajectory:
+            positions, velocities = positions[:, 0], velocities[:, 0]
+
+        return WorldParticleOutput(positions, velocities)

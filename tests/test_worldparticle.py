@@ -78,3 +78,86 @@ def test_predictor():
 
     assert pos_pred.shape == (2, 63, 3)
     assert vel_pred.shape == (2, 63, 3)
+
+def test_worldparticle_rollout():
+    from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector
+    from torch import nn
+
+    corrector_kwargs = dict(
+        dim = 16,
+        enc_depth = 2,
+        dec_depth = 2,
+        enc_dim_head = 6,
+        enc_heads = 2,
+        dec_dim_head = 6,
+        dec_heads = 2
+    )
+
+    predictor = ParticlePredictor(delta_time = 0.01)
+
+    class DummyTokenizer(nn.Module):
+        def forward(self, pos, vel, mass = None):
+            return torch.randn(pos.shape[0], pos.shape[1], 16)
+
+    model = WorldParticle(
+        predictor = predictor,
+        corrector = corrector_kwargs,
+        tokenizer = DummyTokenizer()
+    )
+
+    pos = torch.randn(2, 63, 3)
+    vel = torch.randn(2, 63, 3)
+    forces = torch.randn(2, 63, 3)
+    mass = torch.ones(2, 63)
+    lens = torch.tensor((63, 31))
+
+    # default single step - no time dim in output
+
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, tokenizer_kwargs = dict(mass = mass))
+
+    assert out.pos.shape == (2, 63, 3)
+    assert out.vel.shape == (2, 63, 3)
+
+    # explicit num_steps=1 - caller asked for trajectory, gets time dim
+
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 1, tokenizer_kwargs = dict(mass = mass))
+
+    assert out.pos.shape == (2, 1, 63, 3)
+    assert out.vel.shape == (2, 1, 63, 3)
+
+    # multi-step rollout
+
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 3, tokenizer_kwargs = dict(mass = mass))
+
+    assert out.pos.shape == (2, 3, 63, 3)
+    assert out.vel.shape == (2, 3, 63, 3)
+
+    # without tokenizer - tokens passed directly
+
+    model_no_tok = WorldParticle(predictor = predictor, corrector = corrector_kwargs)
+
+    tokens = torch.randn(2, 63, 16)
+    out = model_no_tok(tokens = tokens, pos = pos, vel = vel, mass = mass, forces = forces, lens = lens)
+
+    assert out.pos.shape == (2, 63, 3)
+
+    # test return_initial_state
+
+    out = model_no_tok(tokens = tokens, pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, return_initial_state = True)
+
+    assert out.pos.shape == (2, 2, 63, 3) # single step inferred, but +1 for initial
+    assert torch.allclose(out.pos[:, 0], pos)
+
+    # 4D tokens auto-infers trajectory
+
+    tokens_4d = torch.randn(2, 3, 63, 16)
+    out = model_no_tok(tokens = tokens_4d, pos = pos, vel = vel, mass = mass, forces = forces, lens = lens)
+
+    assert out.pos.shape == (2, 3, 63, 3)
+
+    # 4D forces auto-infers trajectory
+
+    forces_4d = torch.randn(2, 3, 63, 3)
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces_4d, lens = lens, tokenizer_kwargs = dict(mass = mass))
+
+    assert out.pos.shape == (2, 3, 63, 3)
