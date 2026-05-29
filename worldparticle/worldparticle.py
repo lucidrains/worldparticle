@@ -36,6 +36,7 @@ def divisible_by(num, den):
 def is_odd(n):
     return not divisible_by(n, 2)
 
+
 # tensor helpers
 
 def l2norm(t):
@@ -381,16 +382,7 @@ class ParticleTransformerCorrector(Module):
         assert divisible_by(enc_dim_head, 6), f'enc_dim_head ({enc_dim_head}) must be divisible by 6 for 3d axial rotary embeddings'
         self.axial_rotary_emb = AxialRotaryEmbeddings(enc_dim_head)
 
-        # determine encoder-decoder layer matching
-        # match as many as possible, pad with last if decoder is deeper
-        # take the last dec_depth encoder layers if encoder is deeper
 
-        if dec_depth <= enc_depth:
-            enc_layer_indices = list(range(enc_depth - dec_depth, enc_depth))
-        else:
-            enc_layer_indices = list(range(enc_depth)) + [enc_depth - 1] * (dec_depth - enc_depth)
-
-        self.register_buffer('enc_layer_indices', tensor(enc_layer_indices))
 
         # super token encoder - self attention -> token merge -> feed forward
 
@@ -491,7 +483,14 @@ class ParticleTransformerCorrector(Module):
         dec_tokens = tokens
         rotary_emb = self.axial_rotary_emb(pos)
 
-        for ind, (dec_layer, enc_layer_index) in enumerate(zip(self.dec_layers, self.enc_layer_indices)):
+        # the decoder attends to the final merged super particle tokens
+
+        layer_enc_tokens, layer_enc_pos, layer_enc_weights, layer_enc_lens = enc_intermediates[-1]
+
+        context_rotary_emb = self.axial_rotary_emb(layer_enc_pos)
+        context_mask = lens_to_mask(layer_enc_lens, layer_enc_tokens.shape[1])
+
+        for ind, dec_layer in enumerate(self.dec_layers):
 
             (
                 cross_context_norm,
@@ -502,13 +501,6 @@ class ParticleTransformerCorrector(Module):
                 ff_norm,
                 ff
             ) = dec_layer
-
-            # the decoder attends to successively merged super particle tokens
-
-            layer_enc_tokens, layer_enc_pos, layer_enc_weights, layer_enc_lens = enc_intermediates[enc_layer_index]
-
-            context_rotary_emb = self.axial_rotary_emb(layer_enc_pos)
-            context_mask = lens_to_mask(layer_enc_lens, layer_enc_tokens.shape[1])
 
             if self.film_context_with_weights:
                 context_cond = self.weight_to_cond(layer_enc_weights)
