@@ -287,7 +287,7 @@ class Attention(Module):
         dim_inner = dim_head * heads
         self.scale = dim_head ** -0.5
 
-        self.to_queries = Linear(dim, dim_inner, bias = False)
+        self.to_queries_gates = Linear(dim, dim_inner * 2, bias = False)
         self.to_keys_values = Linear(dim, dim_inner * 2, bias = False)
 
         self.to_out = Linear(dim_inner, dim)
@@ -305,8 +305,8 @@ class Attention(Module):
     ):
         context = default(context, tokens)
 
-        queries, keys, values = (
-            self.to_queries(tokens),
+        queries, gates, keys, values = (
+            *self.to_queries_gates(tokens).chunk(2, dim = -1),
             *self.to_keys_values(context).chunk(2, dim = -1)
         )
 
@@ -329,6 +329,7 @@ class Attention(Module):
 
         out = self.merge_heads(out)
 
+        out = out * gates.sigmoid()
         return self.to_out(out)
 
 # film
