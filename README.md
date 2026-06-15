@@ -54,10 +54,8 @@ out = model(
     vel = vel,
     mass = mass,
     forces = forces,
-    tokenizer_kwargs = dict(
-        attrs = mass,
-        boundary_pos = boundary_pos
-    )
+    attrs = mass,
+    boundary_pos = boundary_pos
 )
 
 # out.pos (2, 512, 3)
@@ -72,10 +70,8 @@ out_trajectory = model(
     mass = mass,
     forces = forces,
     return_initial_state = True,
-    tokenizer_kwargs = dict(
-        attrs = mass,
-        boundary_pos = boundary_pos
-    )
+    attrs = mass,
+    boundary_pos = boundary_pos
 )
 
 # out_trajectory.pos (2, 11, 512, 3)

@@ -743,7 +743,17 @@ class WorldParticle(Module):
         lens = None,                    # (b)
         num_steps = None,               # ()
         return_initial_state = False,
-        tokenizer_kwargs: dict = dict()
+        # kwargs below for tokenizer
+        attrs = None,
+        boundary_pos = None,
+        boundary_attrs = None,
+        pos_rest = None,
+        topo_indices = None,
+        topo_mask = None,
+        spatial_indices = None,
+        spatial_mask = None,
+        boundary_indices = None,
+        boundary_mask = None,
     ):
         return_trajectory = exists(num_steps) or return_initial_state
         has_tokenizer = exists(self.tokenizer)
@@ -779,7 +789,8 @@ class WorldParticle(Module):
         curr_pos, curr_vel = pos, vel
         positions, velocities = [], []
 
-        for step_forces, step_tokens in zip(forces, tokens):
+        for ind, (step_forces, step_tokens) in enumerate(zip(forces, tokens)):
+            is_first_pred = ind == 0
 
             pred_pos, pred_vel = self.predictor(
                 pos = curr_pos,
@@ -789,7 +800,24 @@ class WorldParticle(Module):
             )
 
             if has_tokenizer:
-                step_tokens = self.tokenizer(pos = pred_pos, vel = pred_vel, **tokenizer_kwargs)
+                kwargs = dict(
+                    attrs = attrs,
+                    boundary_pos = boundary_pos,
+                    boundary_attrs = boundary_attrs,
+                    pos_rest = pos_rest,
+                    topo_indices = topo_indices,
+                    topo_mask = topo_mask
+                )
+
+                if is_first_pred:
+                    kwargs.update(dict(
+                        spatial_indices = spatial_indices,
+                        spatial_mask = spatial_mask,
+                        boundary_indices = boundary_indices,
+                        boundary_mask = boundary_mask
+                    ))
+
+                step_tokens = self.tokenizer(pos = pred_pos, vel = pred_vel, **kwargs)
 
             assert exists(step_tokens), 'tokens must be provided if tokenizer is not available'
 

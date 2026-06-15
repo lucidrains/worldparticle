@@ -123,21 +123,21 @@ def test_worldparticle_rollout():
 
     # default single step - no time dim in output
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, tokenizer_kwargs = dict(attrs = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, attrs = mass)
 
     assert out.pos.shape == (2, 63, 3)
     assert out.vel.shape == (2, 63, 3)
 
     # explicit num_steps=1 - caller asked for trajectory, gets time dim
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 1, tokenizer_kwargs = dict(attrs = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 1, attrs = mass)
 
     assert out.pos.shape == (2, 1, 63, 3)
     assert out.vel.shape == (2, 1, 63, 3)
 
     # multi-step rollout
 
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 3, tokenizer_kwargs = dict(attrs = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces, lens = lens, num_steps = 3, attrs = mass)
 
     assert out.pos.shape == (2, 3, 63, 3)
     assert out.vel.shape == (2, 3, 63, 3)
@@ -168,7 +168,7 @@ def test_worldparticle_rollout():
     # 4D forces auto-infers trajectory
 
     forces_4d = torch.randn(2, 3, 63, 3)
-    out = model(pos = pos, vel = vel, mass = mass, forces = forces_4d, lens = lens, tokenizer_kwargs = dict(attrs = mass))
+    out = model(pos = pos, vel = vel, mass = mass, forces = forces_4d, lens = lens, attrs = mass)
 
     assert out.pos.shape == (2, 3, 63, 3)
 
