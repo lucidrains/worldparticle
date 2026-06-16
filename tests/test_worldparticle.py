@@ -10,6 +10,7 @@ try:
 except ImportError:
     HAS_TORCH_CLUSTER = False
 
+from torch_einops_utils import lens_to_mask
 from worldparticle.worldparticle import merge_tokens, ParticleTransformerCorrector, ParticleTokenizer
 
 @param('has_pos', (False, True))
@@ -209,3 +210,28 @@ def test_dynamic_neighbor_derivation():
     # Ensure gradients flow
     loss = tokens.mean()
     loss.backward()
+
+def test_merge_tokens_tie_break_mass_conservation():
+    tokens = torch.randn(2, 64, 16)
+    pos = torch.randn(2, 64, 3)
+    weights = torch.ones(2, 64)
+    lens = torch.tensor((64, 32))
+
+    mask = lens_to_mask(lens, 64)
+    weights = weights * mask.float()
+
+    initial_mass = weights.sum(dim = -1)
+
+    for _ in range(5):
+        tokens, pos, weights, lens = merge_tokens(
+            tokens, pos, weights, lens, tie_break_duplicate_matches = True
+        )
+
+        # mass should be perfectly conserved
+
+        assert torch.allclose(weights.sum(dim = -1), initial_mass)
+
+        # variable length sequence boundaries should be cleanly 0 padding
+
+        mask = lens_to_mask(lens, weights.shape[1])
+        assert (weights[~mask] == 0.).all()

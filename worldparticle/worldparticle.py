@@ -148,6 +148,7 @@ def merge_tokens(
     pos = None,     # (b n 3)
     weights = None, # (b n)
     lens = None,    # (b)
+    tie_break_duplicate_matches = True,
 ):
     batch, seq_len, device = *tokens.shape[:2], tokens.device
 
@@ -174,7 +175,7 @@ def merge_tokens(
 
     src_tokens, tgt_tokens = rearrange(tokens, 'b (n two) d -> two b n d', two = 2)
     src_weights, tgt_weights = rearrange(weights, 'b (n two) -> two b n', two = 2)
-    _, tgt_mask = rearrange(mask, 'b (n two) -> two b n', two = 2)
+    src_mask, tgt_mask = rearrange(mask, 'b (n two) -> two b n', two = 2)
 
     if exists(pos):
         src_pos, tgt_pos = rearrange(pos, 'b (n two) p -> two b n p', two = 2)
@@ -205,41 +206,57 @@ def merge_tokens(
         weighted_src_pos = einx.multiply('b n p, b n', src_pos, src_weights)
         weighted_tgt_pos = einx.multiply('b n p, b n', tgt_pos, tgt_weights)
 
-    closest_tgt_tokens = gather_vectors(weighted_tgt_tokens, closest_match_index)
-    closest_tgt_weights = gather_vectors(tgt_weights, closest_match_index)
+    match_mask = torch.zeros_like(sim, dtype = torch.bool).scatter_(-1, rearrange(closest_match_index, '... -> ... 1'), True)
+
+    # to prevent double merging, break ties by only allowing the highest similarity match to merge
+
+    if tie_break_duplicate_matches:
+        selected_sims = einx.where('b i j, b i j,', match_mask, sim, mask_value)
+        winning_src_index = selected_sims.argmax(dim = -2)
+        match_mask &= torch.zeros_like(sim, dtype = torch.bool).scatter_(-2, rearrange(winning_src_index, 'b j -> b 1 j'), True)
+
+    # prevent padded tokens from participating
+
+    match_mask &= rearrange(src_mask, 'b i -> b i 1')
+
+    is_merged_src = einx.any('b i j -> b i', match_mask)
+    is_merged_tgt = einx.any('b i j -> b j', match_mask)
+
+    match_index = match_mask.long().argmax(dim = -1)
+
+    closest_tgt_tokens = gather_vectors(weighted_tgt_tokens, match_index)
+    closest_tgt_weights = gather_vectors(tgt_weights, match_index)
+
+    closest_tgt_tokens = einx.where('b n, b n d,', is_merged_src, closest_tgt_tokens, 0.)
+    closest_tgt_weights = einx.where('b n, b n,', is_merged_src, closest_tgt_weights, 0.)
 
     merged_weighted_tokens = weighted_src_tokens + closest_tgt_tokens
     merged_weights = src_weights + closest_tgt_weights
     merged_tokens = einx.divide('b n d, b n', merged_weighted_tokens, merged_weights.clamp(min = 1e-5))
 
     if exists(pos):
-        closest_tgt_pos = gather_vectors(weighted_tgt_pos, closest_match_index)
+        closest_tgt_pos = gather_vectors(weighted_tgt_pos, match_index)
+        closest_tgt_pos = einx.where('b n, b n p,', is_merged_src, closest_tgt_pos, 0.)
+
         merged_weighted_pos = weighted_src_pos + closest_tgt_pos
         merged_pos = einx.divide('b n p, b n', merged_weighted_pos, merged_weights.clamp(min = 1e-5))
 
     # handle unmerged tokens
 
-    tgt_mask_unmerged = tgt_mask.scatter(1, closest_match_index, False)
+    tgt_mask_unmerged = tgt_mask & ~is_merged_tgt
 
+    merged_lens_list = src_mask.sum(dim = -1).long().tolist()
     unmerged_lens = tgt_mask_unmerged.sum(dim = -1).long()
     unmerged_lens_list = unmerged_lens.tolist()
 
-    unmerged_tgt_tokens = tgt_tokens[tgt_mask_unmerged].split(unmerged_lens_list)
-    unmerged_tgt_weights = tgt_weights[tgt_mask_unmerged].split(unmerged_lens_list)
+    def pack_and_pad(merged_t, unmerged_t):
+        valid_merged = merged_t[src_mask].split(merged_lens_list)
+        valid_unmerged = unmerged_t[tgt_mask_unmerged].split(unmerged_lens_list)
+        return pad_sequence([cat(t) for t in zip(valid_merged, valid_unmerged)], dim = 0)
 
-    unmerged_tgt_tokens = pad_sequence(unmerged_tgt_tokens, dim = 0)
-    unmerged_tgt_weights = pad_sequence(unmerged_tgt_weights, dim = 0)
-
-    if exists(pos):
-        unmerged_tgt_pos = tgt_pos[tgt_mask_unmerged].split(unmerged_lens_list)
-        unmerged_tgt_pos = pad_sequence(unmerged_tgt_pos, dim = 0)
-
-    # output are the merged tokens and unmerged target tokens
-
-    output_tokens = cat((merged_tokens, unmerged_tgt_tokens), dim = 1)
-    output_weights = cat((merged_weights, unmerged_tgt_weights), dim = 1)
-
-    output_pos = cat((merged_pos, unmerged_tgt_pos), dim = 1) if exists(pos) else None
+    output_tokens = pack_and_pad(merged_tokens, tgt_tokens)
+    output_weights = pack_and_pad(merged_weights, tgt_weights)
+    output_pos = pack_and_pad(merged_pos, tgt_pos) if exists(pos) else None
 
     half_orig_lens = (lens + 1) // 2
     output_lens = unmerged_lens + half_orig_lens
@@ -377,13 +394,14 @@ class ParticleTransformerCorrector(Module):
         pred_num_layers = 5,
         film_context_with_weights = False,
         film_cond_dim = None,
+        tie_break_duplicate_matches = True,
     ):
         super().__init__()
 
         assert divisible_by(enc_dim_head, 6), f'enc_dim_head ({enc_dim_head}) must be divisible by 6 for 3d axial rotary embeddings'
         self.axial_rotary_emb = AxialRotaryEmbeddings(enc_dim_head)
 
-
+        self.tie_break_duplicate_matches = tie_break_duplicate_matches
 
         # super token encoder - self attention -> token merge -> feed forward
 
@@ -470,7 +488,8 @@ class ParticleTransformerCorrector(Module):
                 enc_tokens,
                 pos = enc_pos,
                 weights = enc_weights,
-                lens = enc_lens
+                lens = enc_lens,
+                tie_break_duplicate_matches = self.tie_break_duplicate_matches
             )
 
             # feedforward
