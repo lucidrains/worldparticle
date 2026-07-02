@@ -68,7 +68,7 @@ def test_corrector(film_context_with_weights):
     pos = torch.randn(2, 63, 3)
     lens = torch.tensor((63, 31))
 
-    pos_delta, vel_delta = corrector(tokens, pos = pos, lens = lens)
+    pos_delta, vel_delta, _ = corrector(tokens, pos = pos, lens = lens)
 
     assert pos_delta.shape == (2, 63, 3)
     assert vel_delta.shape == (2, 63, 3)
@@ -235,3 +235,100 @@ def test_merge_tokens_tie_break_mass_conservation():
 
         mask = lens_to_mask(lens, weights.shape[1])
         assert (weights[~mask] == 0.).all()
+
+def test_worldparticle_training():
+    from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector, ParticleTokenizer
+
+    predictor = ParticlePredictor(delta_time = 0.01)
+
+    tokenizer = ParticleTokenizer(
+        dim = 16,
+        dim_attr = 1,
+        grid_res = 5
+    )
+
+    model = WorldParticle(
+        predictor = predictor,
+        corrector = dict(
+            dim = 16,
+            enc_depth = 2,
+            dec_depth = 2,
+            enc_dim_head = 6,
+            enc_heads = 2,
+            dec_dim_head = 6,
+            dec_heads = 2
+        ),
+        tokenizer = tokenizer,
+        predict_next_latent = True
+    )
+
+    pos = torch.randn(2, 63, 3)
+    vel = torch.randn(2, 63, 3)
+    forces = torch.randn(2, 3, 63, 3)
+    target_pos = torch.randn(2, 3, 63, 3)
+    target_vel = torch.randn(2, 3, 63, 3)
+    mass = torch.ones(2, 63)
+    lens = torch.tensor((63, 31))
+
+    loss, out = model(
+        pos = pos,
+        vel = vel,
+        mass = mass,
+        forces = forces,
+        lens = lens,
+        attrs = mass,
+        target_pos = target_pos,
+        target_vel = target_vel
+    )
+
+    assert out.pos.shape == (2, 3, 63, 3)
+    assert out.vel.shape == (2, 3, 63, 3)
+
+    assert loss.ndim == 0
+    loss.backward()
+
+@param('use_curriculum_learning', (False, True))
+def test_curriculum_loss(use_curriculum_learning):
+    from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTokenizer
+
+    model = WorldParticle(
+        predictor = ParticlePredictor(
+            delta_time = 0.01
+        ),
+        corrector = dict(
+            dim = 16,
+            enc_depth = 1,
+            dec_depth = 1,
+            enc_dim_head = 6,
+            enc_heads = 1,
+            dec_dim_head = 6,
+            dec_heads = 1
+        ),
+        tokenizer = ParticleTokenizer(
+            dim = 16,
+            dim_attr = 1,
+            grid_res = 5
+        ),
+        use_curriculum_learning = use_curriculum_learning
+    )
+
+    pos = torch.randn(2, 10, 3)
+    vel = torch.randn(2, 10, 3)
+    mass = torch.ones(2, 10)
+    attrs = torch.randn(2, 10, 1)
+    forces = torch.randn(2, 3, 10, 3)
+    target_pos = torch.randn(2, 3, 10, 3)
+    target_vel = torch.randn(2, 3, 10, 3)
+
+    loss, out = model(
+        pos = pos,
+        vel = vel,
+        mass = mass,
+        forces = forces,
+        attrs = attrs,
+        target_pos = target_pos,
+        target_vel = target_vel
+    )
+
+    assert loss.ndim == 0
+    loss.backward()

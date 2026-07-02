@@ -8,7 +8,7 @@ from torch.nn import Linear, Module, ModuleList, RMSNorm, Sequential, Parameter
 import torch.nn.functional as F
 
 import einx
-from einops import rearrange, einsum
+from einops import rearrange, einsum, reduce
 from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import create_mlp
@@ -29,6 +29,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def last(seq):
+    return seq[-1]
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -377,7 +380,41 @@ class FiLM(Module):
 
 # classes
 
-CorrectorOutput = namedtuple('CorrectorOutput', ['pos', 'vel'])
+class ResidualDynamics(Module):
+    def __init__(
+        self,
+        dim,
+        dim_hidden = None,
+        num_layers = 3
+    ):
+        super().__init__()
+        dim_hidden = default(dim_hidden, dim)
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim * 2),
+            create_mlp(
+                dim_hidden,
+                depth = num_layers - 1,
+                dim_in = dim * 2,
+                dim_out = dim
+            )
+        )
+
+        # zero init last linear layer
+
+        last_linear = last([m for m in last(self.net).modules() if isinstance(m, nn.Linear)])
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def forward(
+        self,
+        curr_latent,
+        next_token_embeds
+    ):
+        dynamics_input = cat((curr_latent, next_token_embeds), dim = -1)
+        return curr_latent + self.net(dynamics_input)
+
+CorrectorOutput = namedtuple('CorrectorOutput', ['pos', 'vel', 'hidden'])
 
 class ParticleTransformerCorrector(Module):
     def __init__(
@@ -397,6 +434,8 @@ class ParticleTransformerCorrector(Module):
         tie_break_duplicate_matches = True,
     ):
         super().__init__()
+        self.returns_hidden = True
+        self.dim = dim
 
         assert divisible_by(enc_dim_head, 6), f'enc_dim_head ({enc_dim_head}) must be divisible by 6 for 3d axial rotary embeddings'
         self.axial_rotary_emb = AxialRotaryEmbeddings(enc_dim_head)
@@ -549,10 +588,11 @@ class ParticleTransformerCorrector(Module):
 
         # predict position and velocity residuals
 
-        pos_vel = self.to_pred(self.final_norm(dec_tokens))
+        hidden = self.final_norm(dec_tokens)
+        pos_vel = self.to_pred(hidden)
         pos_residual, vel_residual = pos_vel.chunk(2, dim = -1)
 
-        return CorrectorOutput(pos_residual, vel_residual)
+        return CorrectorOutput(pos_residual, vel_residual, hidden)
 
 # non-neural predictor
 
@@ -732,6 +772,7 @@ class ParticleTokenizer(Module):
 
 # main module
 
+Losses = namedtuple('Losses', ['ce', 'next_latent', 'kl', 'sigreg'])
 WorldParticleOutput = namedtuple('WorldParticleOutput', ['pos', 'vel'])
 
 class WorldParticle(Module):
@@ -740,7 +781,13 @@ class WorldParticle(Module):
         *,
         predictor: ParticlePredictor | dict | None = None,
         corrector: ParticleTransformerCorrector | dict,
-        tokenizer: Module | None = None
+        tokenizer: Module | None = None,
+        predict_next_latent = False,    # Teoh et al. https://arxiv.org/abs/2511.05963
+        next_latent_loss_weight = 1.0,
+        use_curriculum_learning = True,
+        dynamic_loss_temperature = 1.0,
+        dynamics_hidden_dim = None,
+        dynamics_num_layers = 3,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -750,11 +797,33 @@ class WorldParticle(Module):
         self.predictor = ParticlePredictor(**predictor) if isinstance(predictor, dict) else predictor
         self.corrector = ParticleTransformerCorrector(**corrector) if isinstance(corrector, dict) else corrector
 
+        # world model
+
+        self.predict_next_latent = predict_next_latent
+        self.next_latent_loss_weight = next_latent_loss_weight
+        self.use_curriculum_learning = use_curriculum_learning
+        self.dynamic_loss_temperature = dynamic_loss_temperature
+
+        if predict_next_latent:
+            assert self.corrector.returns_hidden, 'corrector must return hidden state'
+            dim = self.corrector.dim
+            assert exists(dim), 'corrector must have a dim attribute'
+
+            self.dynamics_model = ResidualDynamics(
+                dim = dim,
+                dim_hidden = dynamics_hidden_dim,
+                num_layers = dynamics_num_layers
+            )
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def forward(
         self,
         *,
         pos,                            # (b n 3)
         vel,                            # (b n 3)
+        target_pos = None,              # (b steps n 3)
+        target_vel = None,              # (b steps n 3)
         tokens = None,                  # (b n d) | (b steps n d)
         mass = None,                    # (b n)
         forces = None,                  # (b n 3) | (b steps n 3)
@@ -795,7 +864,14 @@ class WorldParticle(Module):
         # auto-infer num steps
 
         if not exists(num_steps):
-            num_steps = forces.shape[1] if forces_has_time else (tokens.shape[1] if tokens_has_time else 1)
+            if exists(target_pos):
+                num_steps = target_pos.shape[1] if is_tensor_with_time(target_pos) else 1
+            elif forces_has_time:
+                num_steps = forces.shape[1]
+            elif tokens_has_time:
+                num_steps = tokens.shape[1]
+            else:
+                num_steps = 1
             return_trajectory = (num_steps > 1) or return_initial_state
 
         # unpack time dimension if exists, else repeat
@@ -803,12 +879,19 @@ class WorldParticle(Module):
         forces = to_iterable(forces, forces_has_time)
         tokens = to_iterable(tokens, tokens_has_time)
 
+        target_pos_iter = to_iterable(target_pos, is_tensor_with_time(target_pos)) if exists(target_pos) else [None] * num_steps
+        target_vel_iter = to_iterable(target_vel, is_tensor_with_time(target_vel)) if exists(target_vel) else [None] * num_steps
+
         # rollout
 
         curr_pos, curr_vel = pos, vel
         positions, velocities = [], []
 
-        for ind, (step_forces, step_tokens) in enumerate(zip(forces, tokens)):
+        total_loss = self.zero
+        cum_loss = torch.zeros(pos.shape[0], device = pos.device)
+        prev_hidden = None
+
+        for ind, (step_forces, step_tokens, step_target_pos, step_target_vel) in enumerate(zip(forces, tokens, target_pos_iter, target_vel_iter)):
             is_first_pred = ind == 0
 
             pred_pos, pred_vel = self.predictor(
@@ -840,7 +923,7 @@ class WorldParticle(Module):
 
             assert exists(step_tokens), 'tokens must be provided if tokenizer is not available'
 
-            pos_residual, vel_residual = self.corrector(
+            pos_residual, vel_residual, curr_hidden = self.corrector(
                 tokens = step_tokens,
                 pos = pred_pos,
                 weights = weights,
@@ -853,6 +936,44 @@ class WorldParticle(Module):
             positions.append(curr_pos)
             velocities.append(curr_vel)
 
+            # losses
+
+            if exists(step_target_pos) and exists(step_target_vel):
+
+                # get target hidden state with stop gradient
+
+                with torch.no_grad():
+                    target_tokens = self.tokenizer(pos = step_target_pos, vel = step_target_vel, **kwargs) if has_tokenizer else step_tokens
+                    _, _, target_hidden = self.corrector(
+                        tokens = target_tokens,
+                        pos = step_target_pos,
+                        weights = weights,
+                        lens = lens
+                    )
+
+                # step mse loss
+
+                step_pos_loss = F.mse_loss(curr_pos, step_target_pos, reduction = 'none')
+                step_vel_loss = F.mse_loss(curr_vel, step_target_vel, reduction = 'none')
+
+                step_loss = reduce(step_pos_loss + step_vel_loss, 'b ... -> b', 'mean')
+
+                # world model
+
+                if self.predict_next_latent and exists(prev_hidden):
+                    next_hidden_pred = self.dynamics_model(prev_hidden, step_tokens.detach())
+                    step_latent_loss = F.smooth_l1_loss(next_hidden_pred, target_hidden, reduction = 'none')
+                    step_loss = step_loss + self.next_latent_loss_weight * reduce(step_latent_loss, 'b ... -> b', 'mean')
+
+                # maybe curriculum learning
+
+                dynamic_weight = (-cum_loss / self.dynamic_loss_temperature).exp() if self.use_curriculum_learning else 1.
+                total_loss = total_loss + (step_loss * dynamic_weight).mean()
+
+                cum_loss = cum_loss + step_loss.detach()
+
+            prev_hidden = curr_hidden
+
         if return_initial_state:
             positions.insert(0, pos)
             velocities.insert(0, vel)
@@ -864,4 +985,9 @@ class WorldParticle(Module):
         if not return_trajectory:
             positions, velocities = positions[:, 0], velocities[:, 0]
 
-        return WorldParticleOutput(positions, velocities)
+        out = WorldParticleOutput(positions, velocities)
+
+        if exists(target_pos) and exists(target_vel):
+            return total_loss, out
+
+        return out

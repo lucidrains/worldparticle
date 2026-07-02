@@ -1,6 +1,6 @@
 <img src="./fig2.png" width="400px"></img>
 
-## WorldParticle (wip)
+## WorldParticle
 
 Implementation of [WorldParticle](https://arxiv.org/abs/2605.15305), Unified Simulation of Lagrangian Particle Dynamics via Transformer
 
@@ -89,5 +89,17 @@ out_trajectory = model(
     archivePrefix = {arXiv},
     primaryClass = {cs.GR},
     url     = {https://arxiv.org/abs/2605.15305},
+}
+```
+
+```bibtex
+@misc{teoh2026nextlatentpredictiontransformerslearn,
+    title   = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year    = {2026},
+    eprint  = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.05963},
 }
 ```
