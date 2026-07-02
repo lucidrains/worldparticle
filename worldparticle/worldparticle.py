@@ -8,7 +8,7 @@ from torch.nn import Linear, Module, ModuleList, RMSNorm, Sequential, Parameter
 import torch.nn.functional as F
 
 import einx
-from einops import rearrange, einsum, reduce
+from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 
 from x_mlps_pytorch import create_mlp
@@ -20,6 +20,7 @@ from torch_einops_utils import (
     pad_sequence,
     maybe,
     lens_to_mask,
+    masked_mean,
 )
 
 # helpers
@@ -772,7 +773,7 @@ class ParticleTokenizer(Module):
 
 # main module
 
-Losses = namedtuple('Losses', ['ce', 'next_latent', 'kl', 'sigreg'])
+Losses = namedtuple('Losses', ['pos', 'vel', 'next_latent'])
 WorldParticleOutput = namedtuple('WorldParticleOutput', ['pos', 'vel'])
 
 class WorldParticle(Module):
@@ -831,6 +832,7 @@ class WorldParticle(Module):
         lens = None,                    # (b)
         num_steps = None,               # ()
         return_initial_state = False,
+        return_loss_breakdown = False,
         # kwargs below for tokenizer
         attrs = None,
         boundary_pos = None,
@@ -888,6 +890,10 @@ class WorldParticle(Module):
         positions, velocities = [], []
 
         total_loss = self.zero
+        total_pos_loss = self.zero
+        total_vel_loss = self.zero
+        total_latent_loss = self.zero
+
         cum_loss = torch.zeros(pos.shape[0], device = pos.device)
         prev_hidden = None
 
@@ -956,18 +962,36 @@ class WorldParticle(Module):
                 step_pos_loss = F.mse_loss(curr_pos, step_target_pos, reduction = 'none')
                 step_vel_loss = F.mse_loss(curr_vel, step_target_vel, reduction = 'none')
 
-                step_loss = reduce(step_pos_loss + step_vel_loss, 'b ... -> b', 'mean')
+                mask = None
+                if exists(lens):
+                    mask = lens_to_mask(lens, curr_pos.shape[1])
+
+                step_pos_loss_val = masked_mean(step_pos_loss, mask = mask, dim = (1, 2))
+                step_vel_loss_val = masked_mean(step_vel_loss, mask = mask, dim = (1, 2))
+                
+                step_loss = step_pos_loss_val + step_vel_loss_val
 
                 # world model
+
+                step_latent_loss_val = self.zero
 
                 if self.predict_next_latent and exists(prev_hidden):
                     next_hidden_pred = self.dynamics_model(prev_hidden, step_tokens.detach())
                     step_latent_loss = F.smooth_l1_loss(next_hidden_pred, target_hidden, reduction = 'none')
-                    step_loss = step_loss + self.next_latent_loss_weight * reduce(step_latent_loss, 'b ... -> b', 'mean')
+                    step_latent_loss = masked_mean(step_latent_loss, mask = mask, dim = (1, 2))
+
+                    step_latent_loss_val = step_latent_loss
+                    step_loss = step_loss + self.next_latent_loss_weight * step_latent_loss
 
                 # maybe curriculum learning
 
                 dynamic_weight = (-cum_loss / self.dynamic_loss_temperature).exp() if self.use_curriculum_learning else 1.
+
+                total_pos_loss = total_pos_loss + step_pos_loss_val.mean()
+                total_vel_loss = total_vel_loss + step_vel_loss_val.mean()
+
+                total_latent_loss = total_latent_loss + step_latent_loss_val.mean()
+
                 total_loss = total_loss + (step_loss * dynamic_weight).mean()
 
                 cum_loss = cum_loss + step_loss.detach()
@@ -987,7 +1011,11 @@ class WorldParticle(Module):
 
         out = WorldParticleOutput(positions, velocities)
 
-        if exists(target_pos) and exists(target_vel):
-            return total_loss, out
+        if not (exists(target_pos) and exists(target_vel)):
+            return out
 
-        return out
+        if return_loss_breakdown:
+            loss_breakdown = Losses(total_pos_loss, total_vel_loss, total_latent_loss)
+            return total_loss, loss_breakdown, out
+
+        return total_loss, out

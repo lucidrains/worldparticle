@@ -52,7 +52,8 @@ def test_merge_tokens(
     assert weights_out[0, 1] == 0.
 
 @param('film_context_with_weights', (False, True))
-def test_corrector(film_context_with_weights):
+@param('variable_length', (False, True))
+def test_corrector(film_context_with_weights, variable_length):
     corrector = ParticleTransformerCorrector(
         dim = 16,
         enc_depth = 2,
@@ -66,7 +67,7 @@ def test_corrector(film_context_with_weights):
 
     tokens = torch.randn(2, 63, 16)
     pos = torch.randn(2, 63, 3)
-    lens = torch.tensor((63, 31))
+    lens = torch.tensor((63, 31)) if variable_length else None
 
     pos_delta, vel_delta, _ = corrector(tokens, pos = pos, lens = lens)
 
@@ -88,7 +89,8 @@ def test_predictor():
     assert pos_pred.shape == (2, 63, 3)
     assert vel_pred.shape == (2, 63, 3)
 
-def test_worldparticle_rollout():
+@param('variable_length', (False, True))
+def test_worldparticle_rollout(variable_length):
     from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector, ParticleTokenizer
     from torch import nn
 
@@ -120,7 +122,7 @@ def test_worldparticle_rollout():
     vel = torch.randn(2, 63, 3)
     forces = torch.randn(2, 63, 3)
     mass = torch.ones(2, 63)
-    lens = torch.tensor((63, 31))
+    lens = torch.tensor((63, 31)) if variable_length else None
 
     # default single step - no time dim in output
 
@@ -236,7 +238,8 @@ def test_merge_tokens_tie_break_mass_conservation():
         mask = lens_to_mask(lens, weights.shape[1])
         assert (weights[~mask] == 0.).all()
 
-def test_worldparticle_training():
+@param('variable_length', (False, True))
+def test_worldparticle_training(variable_length):
     from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTransformerCorrector, ParticleTokenizer
 
     predictor = ParticlePredictor(delta_time = 0.01)
@@ -268,7 +271,7 @@ def test_worldparticle_training():
     target_pos = torch.randn(2, 3, 63, 3)
     target_vel = torch.randn(2, 3, 63, 3)
     mass = torch.ones(2, 63)
-    lens = torch.tensor((63, 31))
+    lens = torch.tensor((63, 31)) if variable_length else None
 
     loss, out = model(
         pos = pos,
@@ -288,7 +291,8 @@ def test_worldparticle_training():
     loss.backward()
 
 @param('use_curriculum_learning', (False, True))
-def test_curriculum_loss(use_curriculum_learning):
+@param('variable_length', (False, True))
+def test_curriculum_loss(use_curriculum_learning, variable_length):
     from worldparticle.worldparticle import WorldParticle, ParticlePredictor, ParticleTokenizer
 
     model = WorldParticle(
@@ -319,12 +323,15 @@ def test_curriculum_loss(use_curriculum_learning):
     forces = torch.randn(2, 3, 10, 3)
     target_pos = torch.randn(2, 3, 10, 3)
     target_vel = torch.randn(2, 3, 10, 3)
+    
+    lens = torch.tensor((10, 5)) if variable_length else None
 
     loss, out = model(
         pos = pos,
         vel = vel,
         mass = mass,
         forces = forces,
+        lens = lens,
         attrs = attrs,
         target_pos = target_pos,
         target_vel = target_vel
@@ -332,3 +339,61 @@ def test_curriculum_loss(use_curriculum_learning):
 
     assert loss.ndim == 0
     loss.backward()
+
+def test_variable_length_loss():
+    from worldparticle.worldparticle import WorldParticle, ParticlePredictor
+
+    model = WorldParticle(
+        predictor = ParticlePredictor(delta_time = 0.01),
+        corrector = dict(
+            dim = 16,
+            enc_depth = 1,
+            dec_depth = 1,
+            enc_dim_head = 6,
+            enc_heads = 1,
+            dec_dim_head = 6,
+            dec_heads = 1
+        ),
+        predict_next_latent = True
+    )
+
+    pos = torch.randn(2, 10, 3)
+    vel = torch.randn(2, 10, 3)
+    tokens = torch.randn(2, 3, 10, 16)
+    forces = torch.randn(2, 3, 10, 3)
+    target_pos = torch.randn(2, 3, 10, 3)
+    target_vel = torch.randn(2, 3, 10, 3)
+    mass = torch.ones(2, 10)
+    
+    lens = torch.tensor((10, 5))
+    
+    loss1, _ = model(
+        pos = pos,
+        vel = vel,
+        tokens = tokens,
+        mass = mass,
+        forces = forces,
+        lens = lens,
+        target_pos = target_pos,
+        target_vel = target_vel
+    )
+    
+    # Change padded elements for the second item
+    target_pos_mod = target_pos.clone()
+    target_pos_mod[1, :, 5:] = 1000.
+    
+    target_vel_mod = target_vel.clone()
+    target_vel_mod[1, :, 5:] = 1000.
+    
+    loss2, _ = model(
+        pos = pos,
+        vel = vel,
+        tokens = tokens,
+        mass = mass,
+        forces = forces,
+        lens = lens,
+        target_pos = target_pos_mod,
+        target_vel = target_vel_mod
+    )
+    
+    assert torch.allclose(loss1, loss2), "Loss should ignore masked target tokens"
