@@ -947,15 +947,17 @@ class WorldParticle(Module):
             if exists(step_target_pos) and exists(step_target_vel):
 
                 # get target hidden state with stop gradient
+                # only needed for the next latent prediction loss
 
-                with torch.no_grad():
-                    target_tokens = self.tokenizer(pos = step_target_pos, vel = step_target_vel, **kwargs) if has_tokenizer else step_tokens
-                    _, _, target_hidden = self.corrector(
-                        tokens = target_tokens,
-                        pos = step_target_pos,
-                        weights = weights,
-                        lens = lens
-                    )
+                if self.predict_next_latent:
+                    with torch.no_grad():
+                        target_tokens = self.tokenizer(pos = step_target_pos, vel = step_target_vel, **kwargs) if has_tokenizer else step_tokens
+                        _, _, target_hidden = self.corrector(
+                            tokens = target_tokens,
+                            pos = step_target_pos,
+                            weights = weights,
+                            lens = lens
+                        )
 
                 # step mse loss
 
